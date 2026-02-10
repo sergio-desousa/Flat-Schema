@@ -1,0 +1,12 @@
+name = "Flat-Schema"
+authority = "cpan:SDS"
+license = "perl_5"
+
+tag_format = "v%v"
+
+[release]
+pause_config = 1
+
+[metadata]
+x_static_install = 1
+
