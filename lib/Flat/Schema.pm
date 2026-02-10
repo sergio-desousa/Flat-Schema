@@ -37,8 +37,6 @@ sub from_profile {
         croak "from_profile(): unsupported profile.report_version ($report_version); must be >= 1";
     }
 
-    # v1 contract: we require a column list in the profile report contract.
-    # If Flat::Profile evolves, we will adapt using only public report fields.
     my $profile_columns = $profile->{columns};
     if (ref($profile_columns) ne 'ARRAY') {
         croak "from_profile(): profile.columns must be an array reference";
@@ -47,7 +45,6 @@ sub from_profile {
     my $self = $class->new();
     my $schema = $self->_build_schema_from_profile($profile);
 
-    # Optional wrapper object could exist later; for now we return the canonical structure.
     return $schema;
 }
 
@@ -75,8 +72,6 @@ sub _profile_meta_from_profile {
         report_version => int($profile->{report_version}),
     );
 
-    # Preserve null-policy fields if present in the profile report contract.
-    # (Schema inherits Profile's null model verbatim; details are handled in later commits.)
     if (exists $profile->{null_empty}) {
         $meta{null_empty} = $profile->{null_empty} ? 1 : 0;
     }
@@ -92,7 +87,6 @@ sub _columns_from_profile {
 
     my @columns_in = @{ $profile->{columns} };
 
-    # Deterministic: always sort by index (0-based).
     @columns_in = sort {
         ($a->{index} // 0) <=> ($b->{index} // 0)
     } @columns_in;
@@ -109,14 +103,12 @@ sub _columns_from_profile {
 
         my $index = int($col->{index});
 
-        # v1 canonical structure: name may be undef/null (no header).
         my $name = exists $col->{name} ? $col->{name} : undef;
         if (defined $name && ref($name) ne '') {
             croak "from_profile(): column.name must be a string or undef";
         }
 
         # Commit 2 scope: structure + determinism only.
-        # Type/nullability inference and issues are implemented in later commits.
         my $type     = 'string';
         my $nullable = 1;
 
@@ -146,12 +138,7 @@ sub _columns_from_profile {
             type       => $type,
             nullable   => $nullable ? 1 : 0,
             provenance => $provenance,
-            issues     => [],     # always include for uniformity at column-level? NO (not in contract)
         };
-
-        # NOTE: The canonical contract uses top-level issues only.
-        # Remove accidental column issues key if present.
-        delete $out->{issues};
 
         push @columns_out, $out;
     }
@@ -194,12 +181,6 @@ sub _encode_json {
         if ($value =~ /\A-?(?:0|[1-9]\d*)\z/) {
             return $value;
         }
-        if ($value eq '0') {
-            return '0';
-        }
-        if ($value eq '1') {
-            return '1';
-        }
         return _json_quote($value);
     }
 
@@ -229,13 +210,14 @@ sub _json_quote {
 
     $s =~ s/\\/\\\\/g;
     $s =~ s/\"/\\\"/g;
+
     $s =~ s/\n/\\n/g;
     $s =~ s/\r/\\r/g;
     $s =~ s/\t/\\t/g;
     $s =~ s/\f/\\f/g;
-    $s =~ s/\b/\\b/g;
+    $s =~ s/\x08/\\b/g;    # backspace character
 
-    # Control chars
+    # Remaining control chars
     $s =~ s/([\x00-\x1f])/sprintf("\\u%04x", ord($1))/ge;
 
     return '"' . $s . '"';
@@ -255,12 +237,6 @@ sub _encode_yaml {
     if ($ref eq '') {
         if ($value =~ /\A-?(?:0|[1-9]\d*)\z/) {
             return $value . "\n";
-        }
-        if ($value eq '0') {
-            return "false\n";
-        }
-        if ($value eq '1') {
-            return "true\n";
         }
         return _yaml_quote($value) . "\n";
     }
@@ -320,7 +296,6 @@ sub _indent_block {
     my ($text, $indent) = @_;
     my $sp = ' ' x $indent;
 
-    $text =~ s/\A//;
     $text =~ s/^/$sp/gm;
 
     return $text;
@@ -337,7 +312,6 @@ sub _ordered_keys_for_path {
 
     my %rank;
 
-    # Top-level schema keys: fixed list + lex fallback.
     if (!@$path) {
         my @ordered = qw(
             schema_version
@@ -353,7 +327,6 @@ sub _ordered_keys_for_path {
         return _ranked_sort_keys($hash, \%rank);
     }
 
-    # Column hash keys.
     if (@$path >= 2 && $path->[0] eq 'columns' && $path->[1] =~ /\A\d+\z/) {
         my @ordered = qw(
             index
@@ -370,21 +343,18 @@ sub _ordered_keys_for_path {
         return _ranked_sort_keys($hash, \%rank);
     }
 
-    # Generator keys.
     if (@$path >= 1 && $path->[0] eq 'generator') {
         my @ordered = qw(name version);
         @rank{@ordered} = (0 .. $#ordered);
         return _ranked_sort_keys($hash, \%rank);
     }
 
-    # Profile keys: keep stable essentials first, then lex.
     if (@$path >= 1 && $path->[0] eq 'profile') {
         my @ordered = qw(report_version null_empty null_tokens rows_profiled generated_by);
         @rank{@ordered} = (0 .. $#ordered);
         return _ranked_sort_keys($hash, \%rank);
     }
 
-    # Provenance keys.
     if (@$path >= 3 && $path->[0] eq 'columns' && $path->[2] eq 'provenance') {
         my @ordered = qw(
             basis
@@ -400,21 +370,18 @@ sub _ordered_keys_for_path {
         return _ranked_sort_keys($hash, \%rank);
     }
 
-    # Null rate rational keys.
     if (@$path >= 4 && $path->[0] eq 'columns' && $path->[3] eq 'null_rate') {
         my @ordered = qw(num den);
         @rank{@ordered} = (0 .. $#ordered);
         return _ranked_sort_keys($hash, \%rank);
     }
 
-    # Issues list elements.
     if (@$path >= 2 && $path->[0] eq 'issues' && $path->[1] =~ /\A\d+\z/) {
         my @ordered = qw(level code message column_index details);
         @rank{@ordered} = (0 .. $#ordered);
         return _ranked_sort_keys($hash, \%rank);
     }
 
-    # Default: lexicographic keys.
     return sort keys %$hash;
 }
 
@@ -456,11 +423,13 @@ B<should> look like.
 The schema is a canonical Perl data structure (hashref + arrays) suitable for
 JSON/YAML serialization and for downstream validation (see L<Flat::Validate>).
 
-=head1 NOTE ABOUT VERSION 0.01
+=head1 STATUS
+
+This distribution is under active development.
 
 Version 0.01 establishes the public schema structure and deterministic
-serialization. Type inference, nullability rules, issues taxonomy emission, and
-user overrides are implemented in subsequent commits.
+serialization. Type inference, nullability rules, issues emission, and user
+overrides are implemented in subsequent commits.
 
 =head1 METHODS
 
@@ -496,4 +465,3 @@ it under the same terms as Perl itself.
 =cut
 
 1;
-
