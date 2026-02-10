@@ -43,13 +43,13 @@ sub from_profile {
     }
 
     my $self = $class->new();
-    my $schema = $self->_build_schema_from_profile($profile);
-
-    return $schema;
+    return $self->_build_schema_from_profile($profile);
 }
 
 sub _build_schema_from_profile {
     my ($self, $profile) = @_;
+
+    my $issues = [];
 
     my $schema = {
         schema_version => 1,
@@ -58,9 +58,11 @@ sub _build_schema_from_profile {
             version => $VERSION,
         },
         profile => $self->_profile_meta_from_profile($profile),
-        columns => $self->_columns_from_profile($profile),
+        columns => $self->_columns_from_profile($profile, $issues),
         issues  => [],
     };
+
+    $schema->{issues} = _sort_issues_deterministically($issues);
 
     return $schema;
 }
@@ -72,6 +74,7 @@ sub _profile_meta_from_profile {
         report_version => int($profile->{report_version}),
     );
 
+    # Preserve null-policy fields if present in the profile report contract.
     if (exists $profile->{null_empty}) {
         $meta{null_empty} = $profile->{null_empty} ? 1 : 0;
     }
@@ -83,15 +86,17 @@ sub _profile_meta_from_profile {
 }
 
 sub _columns_from_profile {
-    my ($self, $profile) = @_;
+    my ($self, $profile, $issues) = @_;
 
     my @columns_in = @{ $profile->{columns} };
 
+    # Deterministic: always sort by index (0-based).
     @columns_in = sort {
         ($a->{index} // 0) <=> ($b->{index} // 0)
     } @columns_in;
 
     my @columns_out;
+
     for my $col (@columns_in) {
         if (ref($col) ne 'HASH') {
             croak "from_profile(): each element of profile.columns must be a hash reference";
@@ -108,9 +113,12 @@ sub _columns_from_profile {
             croak "from_profile(): column.name must be a string or undef";
         }
 
-        # Commit 2 scope: structure + determinism only.
-        my $type     = 'string';
-        my $nullable = 1;
+        my ($type, $type_issues) = _infer_type_from_column($col);
+
+        for my $issue (@$type_issues) {
+            $issue->{column_index} = $index;
+            push @$issues, $issue;
+        }
 
         my $rows_observed = 0;
         if (exists $col->{rows_observed} && defined $col->{rows_observed} && $col->{rows_observed} =~ /\A\d+\z/) {
@@ -122,22 +130,20 @@ sub _columns_from_profile {
             $null_count = int($col->{null_count});
         }
 
-        my $provenance = {
-            basis         => 'profile',
-            rows_observed => $rows_observed,
-            null_count    => $null_count,
-            null_rate     => {
-                num => $null_count,
-                den => $rows_observed,
-            },
-        };
-
         my $out = {
             index      => $index,
             name       => $name,
             type       => $type,
-            nullable   => $nullable ? 1 : 0,
-            provenance => $provenance,
+            nullable   => 1,    # placeholder until Commit 4
+            provenance => {
+                basis         => 'profile',
+                rows_observed => $rows_observed,
+                null_count    => $null_count,
+                null_rate     => {
+                    num => $null_count,
+                    den => $rows_observed,
+                },
+            },
         };
 
         push @columns_out, $out;
@@ -145,6 +151,188 @@ sub _columns_from_profile {
 
     return \@columns_out;
 }
+
+# ------------------------
+# Type inference (v1)
+# ------------------------
+
+sub _infer_type_from_column {
+    my ($col) = @_;
+
+    my $evidence = $col->{type_evidence};
+
+    # No evidence → string
+    if (!defined $evidence || ref($evidence) ne 'HASH' || !%$evidence) {
+        return ('string', []);
+    }
+
+    my %counts = map {
+        $_ => int($evidence->{$_} // 0)
+    } qw(string integer number boolean date datetime);
+
+    my @present = sort grep { $counts{$_} > 0 } keys %counts;
+
+    if (!@present) {
+        return ('string', []);
+    }
+
+    # Temporal vs non-temporal conflict
+    my @temporal = grep { $_ eq 'date' || $_ eq 'datetime' } @present;
+    my @other    = grep { $_ ne 'date' && $_ ne 'datetime' } @present;
+
+    if (@temporal && @other) {
+        return (
+            'string',
+            [
+                {
+                    level   => 'warning',
+                    code    => 'temporal_conflict_widened_to_string',
+                    message => 'Temporal and non-temporal values mixed; widened to string',
+                    details => {
+                        temporal_candidates => \@temporal,
+                        other_candidates    => \@other,
+                        chosen              => 'string',
+                    },
+                },
+            ],
+        );
+    }
+
+    # Temporal widening
+    if (@temporal) {
+        if (grep { $_ eq 'datetime' } @temporal) {
+            if (@temporal > 1) {
+                return (
+                    'datetime',
+                    [
+                        {
+                            level   => 'info',
+                            code    => 'type_widened',
+                            message => 'Date values widened to datetime',
+                            details => {
+                                from => 'date',
+                                to   => 'datetime',
+                            },
+                        },
+                    ],
+                );
+            }
+            return ('datetime', []);
+        }
+        return ('date', []);
+    }
+
+    # Scalar widening chain
+    my @order = qw(boolean integer number string);
+    my %rank  = map { $order[$_] => $_ } 0 .. $#order;
+
+    my $chosen = (sort { $rank{$a} <=> $rank{$b} } @present)[-1];
+
+    if (@present > 1) {
+        return (
+            $chosen,
+            [
+                {
+                    level   => 'warning',
+                    code    => 'mixed_type_evidence',
+                    message => 'Multiple scalar types observed; widened',
+                    details => {
+                        candidates => \@present,
+                        chosen     => $chosen,
+                    },
+                },
+            ],
+        );
+    }
+
+    return ($chosen, []);
+}
+
+# ------------------------
+# Issues ordering (deterministic)
+# ------------------------
+
+sub _sort_issues_deterministically {
+    my ($issues) = @_;
+
+    my %level_rank = (
+        info    => 0,
+        warning => 1,
+    );
+
+    my @sorted = sort {
+        my $la = exists $a->{level} ? $a->{level} : 'warning';
+        my $lb = exists $b->{level} ? $b->{level} : 'warning';
+
+        my $ra = exists $level_rank{$la} ? $level_rank{$la} : 9;
+        my $rb = exists $level_rank{$lb} ? $level_rank{$lb} : 9;
+
+        return $ra <=> $rb
+            || ($a->{code} // '') cmp ($b->{code} // '')
+            || _cmp_column_index($a->{column_index}, $b->{column_index})
+            || ($a->{message} // '') cmp ($b->{message} // '')
+            || _stable_details_string($a->{details}) cmp _stable_details_string($b->{details});
+    } @$issues;
+
+    return \@sorted;
+}
+
+sub _cmp_column_index {
+    my ($a, $b) = @_;
+
+    my $a_is_undef = !defined $a;
+    my $b_is_undef = !defined $b;
+
+    if ($a_is_undef && $b_is_undef) {
+        return 0;
+    }
+    if ($a_is_undef) {
+        return 1;    # undef last
+    }
+    if ($b_is_undef) {
+        return -1;
+    }
+
+    return int($a) <=> int($b);
+}
+
+sub _stable_details_string {
+    my ($details) = @_;
+
+    if (!defined $details) {
+        return '';
+    }
+    if (ref($details) ne 'HASH') {
+        return '';
+    }
+
+    my @keys = sort keys %$details;
+    my @pairs;
+    for my $k (@keys) {
+        my $v = $details->{$k};
+        if (!defined $v) {
+            push @pairs, $k . '=';
+        } elsif (ref($v) eq 'ARRAY') {
+            push @pairs, $k . '=[' . join(',', @$v) . ']';
+        } elsif (ref($v) eq 'HASH') {
+            my @ik = sort keys %$v;
+            my @ip;
+            for my $ik (@ik) {
+                my $iv = $v->{$ik};
+                push @ip, $ik . '=' . (defined $iv ? $iv : '');
+            }
+            push @pairs, $k . '={' . join(',', @ip) . '}';
+        } else {
+            push @pairs, $k . '=' . $v;
+        }
+    }
+
+    return join(';', @pairs);
+}
+
+# ------------------------
+# Deterministic serialization
+# ------------------------
 
 sub to_json {
     my ($self, %args) = @_;
@@ -217,7 +405,6 @@ sub _json_quote {
     $s =~ s/\f/\\f/g;
     $s =~ s/\x08/\\b/g;    # backspace character
 
-    # Remaining control chars
     $s =~ s/([\x00-\x1f])/sprintf("\\u%04x", ord($1))/ge;
 
     return '"' . $s . '"';
@@ -312,6 +499,7 @@ sub _ordered_keys_for_path {
 
     my %rank;
 
+    # Top-level schema keys: fixed list + lex fallback.
     if (!@$path) {
         my @ordered = qw(
             schema_version
@@ -327,6 +515,7 @@ sub _ordered_keys_for_path {
         return _ranked_sort_keys($hash, \%rank);
     }
 
+    # Column hash keys.
     if (@$path >= 2 && $path->[0] eq 'columns' && $path->[1] =~ /\A\d+\z/) {
         my @ordered = qw(
             index
@@ -343,18 +532,21 @@ sub _ordered_keys_for_path {
         return _ranked_sort_keys($hash, \%rank);
     }
 
+    # Generator keys.
     if (@$path >= 1 && $path->[0] eq 'generator') {
         my @ordered = qw(name version);
         @rank{@ordered} = (0 .. $#ordered);
         return _ranked_sort_keys($hash, \%rank);
     }
 
+    # Profile keys.
     if (@$path >= 1 && $path->[0] eq 'profile') {
         my @ordered = qw(report_version null_empty null_tokens rows_profiled generated_by);
         @rank{@ordered} = (0 .. $#ordered);
         return _ranked_sort_keys($hash, \%rank);
     }
 
+    # Provenance keys.
     if (@$path >= 3 && $path->[0] eq 'columns' && $path->[2] eq 'provenance') {
         my @ordered = qw(
             basis
@@ -370,12 +562,14 @@ sub _ordered_keys_for_path {
         return _ranked_sort_keys($hash, \%rank);
     }
 
+    # Null rate rational keys.
     if (@$path >= 4 && $path->[0] eq 'columns' && $path->[3] eq 'null_rate') {
         my @ordered = qw(num den);
         @rank{@ordered} = (0 .. $#ordered);
         return _ranked_sort_keys($hash, \%rank);
     }
 
+    # Issues list elements.
     if (@$path >= 2 && $path->[0] eq 'issues' && $path->[1] =~ /\A\d+\z/) {
         my @ordered = qw(level code message column_index details);
         @rank{@ordered} = (0 .. $#ordered);
@@ -427,9 +621,9 @@ JSON/YAML serialization and for downstream validation (see L<Flat::Validate>).
 
 This distribution is under active development.
 
-Version 0.01 establishes the public schema structure and deterministic
-serialization. Type inference, nullability rules, issues emission, and user
-overrides are implemented in subsequent commits.
+The public schema structure and deterministic serialization exist, and v1 type
+inference (based on profile evidence) is in progress. Nullability inference,
+override application, and additional issues are implemented in subsequent commits.
 
 =head1 METHODS
 
