@@ -51,6 +51,11 @@ sub _build_schema_from_profile {
 
     my $issues = [];
 
+    my $columns = $self->_columns_from_profile($profile, $issues);
+
+    # Nullability / null issues (v1) are based on Profile's null model and observed counts.
+    _apply_nullability_and_null_issues($profile, $columns, $issues);
+
     my $schema = {
         schema_version => 1,
         generator      => {
@@ -58,7 +63,7 @@ sub _build_schema_from_profile {
             version => $VERSION,
         },
         profile => $self->_profile_meta_from_profile($profile),
-        columns => $self->_columns_from_profile($profile, $issues),
+        columns => $columns,
         issues  => [],
     };
 
@@ -80,6 +85,11 @@ sub _profile_meta_from_profile {
     }
     if (exists $profile->{null_tokens} && ref($profile->{null_tokens}) eq 'ARRAY') {
         $meta{null_tokens} = [ @{ $profile->{null_tokens} } ];
+    }
+
+    # If Profile provides rows_profiled, retain it (useful for diagnostics).
+    if (exists $profile->{rows_profiled} && defined $profile->{rows_profiled} && $profile->{rows_profiled} =~ /\A\d+\z/) {
+        $meta{rows_profiled} = int($profile->{rows_profiled});
     }
 
     return \%meta;
@@ -134,7 +144,7 @@ sub _columns_from_profile {
             index      => $index,
             name       => $name,
             type       => $type,
-            nullable   => 1,    # placeholder until Commit 4
+            nullable   => 1,    # set properly in _apply_nullability_and_null_issues()
             provenance => {
                 basis         => 'profile',
                 rows_observed => $rows_observed,
@@ -150,6 +160,72 @@ sub _columns_from_profile {
     }
 
     return \@columns_out;
+}
+
+# ------------------------
+# Nullability inference (v1)
+# ------------------------
+
+sub _apply_nullability_and_null_issues {
+    my ($profile, $columns, $issues) = @_;
+
+    # v1 rule: nullable = true iff null_count > 0 (based on Profile null model).
+    # Edge: if rows_observed == 0, nullable is set true and we emit no_rows_profiled once.
+    my $any_rows_observed = 0;
+
+    for my $col (@$columns) {
+        my $rows_observed = int($col->{provenance}{rows_observed} // 0);
+        my $null_count    = int($col->{provenance}{null_count} // 0);
+
+        if ($rows_observed > 0) {
+            $any_rows_observed = 1;
+        }
+
+        if ($rows_observed == 0) {
+            $col->{nullable} = 1;
+            next;
+        }
+
+        $col->{nullable} = $null_count > 0 ? 1 : 0;
+
+        # all-null column warning
+        if ($null_count == $rows_observed) {
+            push @$issues, {
+                level        => 'warning',
+                code         => 'all_null_column',
+                message      => 'Column contains only null values in profiled rows',
+                column_index => $col->{index},
+                details      => {
+                    null_count    => $null_count,
+                    rows_observed => $rows_observed,
+                },
+            };
+        }
+    }
+
+    my $rows_profiled = undef;
+    if (exists $profile->{rows_profiled} && defined $profile->{rows_profiled} && $profile->{rows_profiled} =~ /\A\d+\z/) {
+        $rows_profiled = int($profile->{rows_profiled});
+    }
+
+    my $no_rows = 0;
+    if (defined $rows_profiled) {
+        $no_rows = $rows_profiled == 0 ? 1 : 0;
+    } else {
+        # If Profile doesn't report rows_profiled, infer from per-column rows_observed.
+        $no_rows = $any_rows_observed ? 0 : 1;
+    }
+
+    if ($no_rows) {
+        push @$issues, {
+            level        => 'warning',
+            code         => 'no_rows_profiled',
+            message      => 'Profile report indicates zero rows were profiled; schema inference is limited',
+            column_index => undef,
+        };
+    }
+
+    return;
 }
 
 # ------------------------
@@ -499,7 +575,6 @@ sub _ordered_keys_for_path {
 
     my %rank;
 
-    # Top-level schema keys: fixed list + lex fallback.
     if (!@$path) {
         my @ordered = qw(
             schema_version
@@ -515,7 +590,6 @@ sub _ordered_keys_for_path {
         return _ranked_sort_keys($hash, \%rank);
     }
 
-    # Column hash keys.
     if (@$path >= 2 && $path->[0] eq 'columns' && $path->[1] =~ /\A\d+\z/) {
         my @ordered = qw(
             index
@@ -532,21 +606,18 @@ sub _ordered_keys_for_path {
         return _ranked_sort_keys($hash, \%rank);
     }
 
-    # Generator keys.
     if (@$path >= 1 && $path->[0] eq 'generator') {
         my @ordered = qw(name version);
         @rank{@ordered} = (0 .. $#ordered);
         return _ranked_sort_keys($hash, \%rank);
     }
 
-    # Profile keys.
     if (@$path >= 1 && $path->[0] eq 'profile') {
         my @ordered = qw(report_version null_empty null_tokens rows_profiled generated_by);
         @rank{@ordered} = (0 .. $#ordered);
         return _ranked_sort_keys($hash, \%rank);
     }
 
-    # Provenance keys.
     if (@$path >= 3 && $path->[0] eq 'columns' && $path->[2] eq 'provenance') {
         my @ordered = qw(
             basis
@@ -562,14 +633,12 @@ sub _ordered_keys_for_path {
         return _ranked_sort_keys($hash, \%rank);
     }
 
-    # Null rate rational keys.
     if (@$path >= 4 && $path->[0] eq 'columns' && $path->[3] eq 'null_rate') {
         my @ordered = qw(num den);
         @rank{@ordered} = (0 .. $#ordered);
         return _ranked_sort_keys($hash, \%rank);
     }
 
-    # Issues list elements.
     if (@$path >= 2 && $path->[0] eq 'issues' && $path->[1] =~ /\A\d+\z/) {
         my @ordered = qw(level code message column_index details);
         @rank{@ordered} = (0 .. $#ordered);
@@ -621,9 +690,9 @@ JSON/YAML serialization and for downstream validation (see L<Flat::Validate>).
 
 This distribution is under active development.
 
-The public schema structure and deterministic serialization exist, and v1 type
-inference (based on profile evidence) is in progress. Nullability inference,
-override application, and additional issues are implemented in subsequent commits.
+Current implementation milestones include deterministic serialization, v1 type
+inference (based on profile evidence), and v1 nullability inference based on
+Profile's null model and observed counts.
 
 =head1 METHODS
 
