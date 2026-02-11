@@ -2,6 +2,9 @@ name = "Flat-Schema"
 authority = "cpan:SDS"
 license = "perl_5"
 
+# README.md is ALWAYS regenerated from POD SSOT.
+readme_from = "lib/Flat/Schema.pm"
+
 tag_format = "v%v"
 
 [release]
@@ -9,4 +12,3 @@ pause_config = 1
 
 [metadata]
 x_static_install = 1
-
