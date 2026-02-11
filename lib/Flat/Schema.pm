@@ -930,19 +930,39 @@ sub _ranked_sort_keys {
 
 Flat::Schema - Deterministic schema contracts for flat files
 
+=head1 WHY THIS EXISTS (IN ONE PARAGRAPH)
+
+In real ETL work, yesterday's CSV becomes today's "contract" whether you meant it or not.
+Flat::Schema makes that contract explicit: generate a deterministic schema from what you
+observed, record ambiguity as issues, and give the next step (validation) something
+stable to enforce.
+
 =head1 SYNOPSIS
 
+Basic usage:
+
+    use Flat::Profile;
     use Flat::Schema;
 
-    my $schema = Flat::Schema->from_profile(
-        profile => $profile_report,
-        overrides => [
-            { column_index => 0, set => { type => 'integer', nullable => 0 } },
-        ],
+    my $profile = Flat::Profile->profile_file(
+        file => "data.csv",
     );
 
-    my $json = Flat::Schema->new()->to_json(schema => $schema);
-    my $yaml = Flat::Schema->new()->to_yaml(schema => $schema);
+    my $schema = Flat::Schema->from_profile(
+        profile => $profile,
+    );
+
+    print Flat::Schema->new()->to_json(schema => $schema);
+
+With overrides:
+
+    my $schema = Flat::Schema->from_profile(
+        profile   => $profile,
+        overrides => [
+            { column_index => 0, set => { type => 'integer', nullable => 0 } },
+            { column_index => 3, set => { name => 'created_at', type => 'datetime' } },
+        ],
+    );
 
 =head1 DESCRIPTION
 
@@ -950,66 +970,306 @@ Flat::Schema consumes reports produced by L<Flat::Profile> and generates a
 deterministic, inspectable schema contract describing what tabular data
 B<should> look like.
 
-The schema is a canonical Perl data structure (hashref + arrays) suitable for
-JSON/YAML serialization and for downstream validation (see L<Flat::Validate>).
-
-=head1 STATUS
-
-This distribution is under active development.
-
-Implemented so far:
+It is the second module in the Flat::* series:
 
 =over 4
 
 =item *
 
-Canonical schema structure (v1)
+Flat::Profile — What the data looks like
 
 =item *
 
-Deterministic JSON/YAML serialization
+Flat::Schema — What the data should look like
 
 =item *
 
-v1 type inference based on profile evidence
-
-=item *
-
-v1 nullability inference based on observed nulls
-
-=item *
-
-v1 user overrides (index-based) with audit trail and override issues
+Flat::Validate — Does the data conform (planned)
 
 =back
 
-=head1 METHODS
+The schema is a canonical Perl data structure that:
 
-=head2 from_profile
+=over 4
+
+=item *
+
+Is stable and deterministic (identical inputs → identical output)
+
+=item *
+
+Is serializable to JSON and YAML
+
+=item *
+
+Captures inference decisions and ambiguity as issues
+
+=item *
+
+Can be consumed by Flat::Validate or other tooling
+
+=back
+
+=head1 REAL-WORLD USE CASES (THE STUFF YOU ACTUALLY DO)
+
+=head2 1) Vendor “helpfully” changes a column (integer → text)
+
+You ingest daily files and one day a numeric column starts containing
+values like C<N/A>, C<unknown>, or C<ERR-17>. Your pipeline should not silently
+coerce this into zero or drop rows.
+
+Workflow:
+
+=over 4
+
+=item 1.
+
+Profile last-known-good
+
+=item 2.
+
+Generate schema (your contract)
+
+=item 3.
+
+Validate future drops against the schema
+
+=back
+
+A typical override when you decide "we accept this as string now":
 
     my $schema = Flat::Schema->from_profile(
-        profile => $profile_report,
+        profile   => $profile,
         overrides => [
-            { column_index => 0, set => { type => 'string', nullable => 1 } },
+            { column_index => 7, set => { type => 'string' } },
         ],
     );
 
-Consumes a Flat::Profile report and returns the canonical schema data structure.
+Flat::Schema will record that the override conflicts with what it inferred, and
+that record is useful during incident review.
 
-Overrides are optional and are applied after inference. Conflicts between
-inferred values and overrides are recorded as issues.
+=head2 2) Columns that are “nullable in real life” even if today they are not
 
-=head2 to_json
+Data often arrives complete in a sample window and then starts missing values
+in production. In v1, nullability is intentionally simple:
 
-    my $json = Flat::Schema->new()->to_json(schema => $schema);
+    nullable = true iff null_count > 0
 
-Deterministically serializes the schema to JSON using canonical key ordering.
+If you know a field is nullable even if today it isn't, force it:
 
-=head2 to_yaml
+    overrides => [
+        { column_index => 2, set => { nullable => 1 } },  # allow missing later
+    ],
 
-    my $yaml = Flat::Schema->new()->to_yaml(schema => $schema);
+=head2 3) Timestamp confusion: date vs datetime vs “whatever the exporter did”
 
-Deterministically serializes the schema to YAML using canonical key ordering.
+When temporal evidence mixes, Flat::Schema chooses predictability over cleverness.
+
+=over 4
+
+=item *
+
+date + datetime → datetime
+
+=item *
+
+temporal + non-temporal → string (and it tells you)
+
+=back
+
+This prevents “maybe parseable” data from becoming quietly wrong later.
+
+=head2 4) “Header row roulette” and naming cleanup
+
+You may get headers like C<Customer ID>, C<customer_id>, C<CUSTID>, or no header at all.
+Schema stores both:
+
+=over 4
+
+=item *
+
+C<index> always
+
+=item *
+
+C<name> when available
+
+=back
+
+If you need normalized naming for downstream systems:
+
+    overrides => [
+        { column_index => 0, set => { name => 'customer_id' } },
+    ],
+
+=head2 5) Reproducible artifacts for tickets, audits, and “what changed?”
+
+Sometimes the most important feature is being able to paste the schema into a ticket,
+diff it in Git, or keep it as a build artifact.
+
+Flat::Schema’s serializers are deterministic by design. If the schema changes, it is
+because the inputs changed (profile or overrides), not because hash order shifted.
+
+=head1 SCHEMA STRUCTURE (AT A GLANCE)
+
+A generated schema contains:
+
+    {
+        schema_version => 1,
+        generator      => { name => "Flat::Schema", version => "0.01" },
+        profile        => { ... },
+        columns        => [ ... ],
+        issues         => [ ... ],
+    }
+
+Each column contains:
+
+    {
+        index      => 0,
+        name       => "id",
+        type       => "integer",
+        nullable   => 0,
+        length     => { min => 1, max => 12 },  # optional
+        overrides  => { ... },                  # optional
+        provenance => {
+            basis         => "profile",
+            rows_observed => 1000,
+            null_count    => 0,
+            null_rate     => { num => 0, den => 1000 },
+            overrides     => [ "type", "nullable" ],  # optional
+        },
+    }
+
+=head1 TYPE INFERENCE (v1)
+
+Type inference is based solely on evidence provided by Flat::Profile.
+
+Scalar widening order:
+
+    boolean → integer → number → string
+
+Temporal handling:
+
+    date + datetime → datetime
+    temporal + non-temporal → string (with warning)
+
+Mixed evidence is widened and recorded as an issue.
+
+=head1 NULLABILITY INFERENCE (v1)
+
+Rules:
+
+=over 4
+
+=item *
+
+nullable = true iff null_count > 0
+
+=item *
+
+If rows_profiled == 0, all columns are nullable
+
+=item *
+
+All-null columns emit warning C<all_null_column>
+
+=item *
+
+Zero profiled rows emits warning C<no_rows_profiled>
+
+=back
+
+=head1 USER OVERRIDES (v1)
+
+Overrides are applied after inference.
+
+Supported fields:
+
+=over 4
+
+=item *
+
+type
+
+=item *
+
+nullable
+
+=item *
+
+name
+
+=item *
+
+length (min/max)
+
+=back
+
+Overrides:
+
+=over 4
+
+=item *
+
+Are index-based (column_index required)
+
+=item *
+
+May conflict with inferred values (recorded as warnings)
+
+=item *
+
+Are recorded in column.overrides
+
+=item *
+
+Are recorded in provenance.overrides
+
+=item *
+
+Emit an informational C<override_applied> issue
+
+=back
+
+Overrides referencing unknown columns cause a hard error.
+
+=head1 DETERMINISTIC SERIALIZATION
+
+Flat::Schema includes built-in deterministic JSON and YAML serializers.
+
+Same input profile + same overrides → identical JSON/YAML.
+
+This is required for reproducible pipelines and meaningful diffs.
+
+=head1 STATUS
+
+Implemented in v1:
+
+=over 4
+
+=item *
+
+Canonical schema structure
+
+=item *
+
+Deterministic serialization
+
+=item *
+
+Type inference
+
+=item *
+
+Nullability inference
+
+=item *
+
+User overrides (index-based)
+
+=back
+
+Future releases may expand the type lattice, constraint modeling, and schema evolution.
 
 =head1 AUTHOR
 
@@ -1021,5 +1281,6 @@ This library is free software; you may redistribute it and/or modify
 it under the same terms as Perl itself.
 
 =cut
+
 
 1;
