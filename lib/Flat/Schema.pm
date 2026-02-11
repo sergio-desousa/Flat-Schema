@@ -42,19 +42,29 @@ sub from_profile {
         croak "from_profile(): profile.columns must be an array reference";
     }
 
+    my $overrides = undef;
+    if (exists $args{overrides}) {
+        $overrides = $args{overrides};
+        if (defined $overrides && ref($overrides) ne 'ARRAY') {
+            croak "from_profile(): overrides must be an array reference";
+        }
+    }
+
     my $self = $class->new();
-    return $self->_build_schema_from_profile($profile);
+    return $self->_build_schema_from_profile($profile, $overrides);
 }
 
 sub _build_schema_from_profile {
-    my ($self, $profile) = @_;
+    my ($self, $profile, $overrides_in) = @_;
 
     my $issues = [];
 
     my $columns = $self->_columns_from_profile($profile, $issues);
 
-    # Nullability / null issues (v1) are based on Profile's null model and observed counts.
     _apply_nullability_and_null_issues($profile, $columns, $issues);
+
+    my $overrides_map = _normalize_overrides($overrides_in);
+    _apply_overrides($columns, $overrides_map, $issues);
 
     my $schema = {
         schema_version => 1,
@@ -79,7 +89,6 @@ sub _profile_meta_from_profile {
         report_version => int($profile->{report_version}),
     );
 
-    # Preserve null-policy fields if present in the profile report contract.
     if (exists $profile->{null_empty}) {
         $meta{null_empty} = $profile->{null_empty} ? 1 : 0;
     }
@@ -87,7 +96,6 @@ sub _profile_meta_from_profile {
         $meta{null_tokens} = [ @{ $profile->{null_tokens} } ];
     }
 
-    # If Profile provides rows_profiled, retain it (useful for diagnostics).
     if (exists $profile->{rows_profiled} && defined $profile->{rows_profiled} && $profile->{rows_profiled} =~ /\A\d+\z/) {
         $meta{rows_profiled} = int($profile->{rows_profiled});
     }
@@ -100,7 +108,6 @@ sub _columns_from_profile {
 
     my @columns_in = @{ $profile->{columns} };
 
-    # Deterministic: always sort by index (0-based).
     @columns_in = sort {
         ($a->{index} // 0) <=> ($b->{index} // 0)
     } @columns_in;
@@ -144,7 +151,7 @@ sub _columns_from_profile {
             index      => $index,
             name       => $name,
             type       => $type,
-            nullable   => 1,    # set properly in _apply_nullability_and_null_issues()
+            nullable   => 1,
             provenance => {
                 basis         => 'profile',
                 rows_observed => $rows_observed,
@@ -169,8 +176,6 @@ sub _columns_from_profile {
 sub _apply_nullability_and_null_issues {
     my ($profile, $columns, $issues) = @_;
 
-    # v1 rule: nullable = true iff null_count > 0 (based on Profile null model).
-    # Edge: if rows_observed == 0, nullable is set true and we emit no_rows_profiled once.
     my $any_rows_observed = 0;
 
     for my $col (@$columns) {
@@ -188,7 +193,6 @@ sub _apply_nullability_and_null_issues {
 
         $col->{nullable} = $null_count > 0 ? 1 : 0;
 
-        # all-null column warning
         if ($null_count == $rows_observed) {
             push @$issues, {
                 level        => 'warning',
@@ -212,7 +216,6 @@ sub _apply_nullability_and_null_issues {
     if (defined $rows_profiled) {
         $no_rows = $rows_profiled == 0 ? 1 : 0;
     } else {
-        # If Profile doesn't report rows_profiled, infer from per-column rows_observed.
         $no_rows = $any_rows_observed ? 0 : 1;
     }
 
@@ -229,6 +232,253 @@ sub _apply_nullability_and_null_issues {
 }
 
 # ------------------------
+# Overrides (v1)
+# ------------------------
+
+sub _normalize_overrides {
+    my ($overrides_in) = @_;
+
+    if (!defined $overrides_in) {
+        return {};
+    }
+
+    my %map;
+
+    for my $entry (@$overrides_in) {
+        if (ref($entry) ne 'HASH') {
+            croak "from_profile(): each overrides entry must be a hash reference";
+        }
+
+        if (!exists $entry->{column_index} || !defined $entry->{column_index} || $entry->{column_index} !~ /\A\d+\z/) {
+            croak "from_profile(): overrides entry missing integer column_index";
+        }
+
+        my $idx = int($entry->{column_index});
+
+        if (!exists $entry->{set} || ref($entry->{set}) ne 'HASH') {
+            croak "from_profile(): overrides entry missing set hash";
+        }
+
+        my %set = %{ $entry->{set} };
+
+        my %allowed = map { $_ => 1 } qw(type nullable name length);
+        for my $k (keys %set) {
+            if (!$allowed{$k}) {
+                croak "from_profile(): override field not supported in v1: $k";
+            }
+        }
+
+        if (exists $set{type}) {
+            if (!defined $set{type} || ref($set{type}) ne '') {
+                croak "from_profile(): override type must be a string";
+            }
+        }
+
+        if (exists $set{nullable}) {
+            if (!defined $set{nullable} || ref($set{nullable}) ne '') {
+                croak "from_profile(): override nullable must be a scalar boolean (0/1)";
+            }
+            $set{nullable} = $set{nullable} ? 1 : 0;
+        }
+
+        if (exists $set{name}) {
+            if (defined $set{name} && ref($set{name}) ne '') {
+                croak "from_profile(): override name must be a string or undef";
+            }
+        }
+
+        if (exists $set{length}) {
+            if (!defined $set{length} || ref($set{length}) ne 'HASH') {
+                croak "from_profile(): override length must be a hash reference";
+            }
+
+            my %len = %{ $set{length} };
+            my %len_allowed = map { $_ => 1 } qw(min max);
+
+            for my $lk (keys %len) {
+                if (!$len_allowed{$lk}) {
+                    croak "from_profile(): override length supports only min/max";
+                }
+                if (defined $len{$lk} && $len{$lk} !~ /\A\d+\z/) {
+                    croak "from_profile(): override length.$lk must be an integer";
+                }
+                $len{$lk} = int($len{$lk}) if defined $len{$lk};
+            }
+
+            $set{length} = \%len;
+        }
+
+        $map{$idx} = {} if !exists $map{$idx};
+        for my $k (sort keys %set) {
+            $map{$idx}{$k} = $set{$k};
+        }
+    }
+
+    return \%map;
+}
+
+sub _apply_overrides {
+    my ($columns, $overrides_map, $issues) = @_;
+
+    return if !%$overrides_map;
+
+    my %col_by_index = map { $_->{index} => $_ } @$columns;
+
+    for my $idx (sort { $a <=> $b } keys %$overrides_map) {
+        if (!exists $col_by_index{$idx}) {
+            croak "from_profile(): override references unknown column_index $idx";
+        }
+
+        my $col = $col_by_index{$idx};
+        my $set = $overrides_map->{$idx};
+
+        my @fields_applied;
+
+        for my $field (sort keys %$set) {
+            my $override_value = $set->{$field};
+
+            if ($field eq 'length') {
+                my $inferred = exists $col->{length} ? $col->{length} : undef;
+                my $different = _different_length($inferred, $override_value);
+
+                if ($different) {
+                    push @$issues, {
+                        level        => 'warning',
+                        code         => 'override_conflicts_with_profile',
+                        message      => 'Override conflicts with inferred value',
+                        column_index => $col->{index},
+                        details      => {
+                            field            => 'length',
+                            overridden_value => _stable_details_string($override_value),
+                            inferred_value   => _stable_details_string($inferred),
+                        },
+                    };
+                }
+
+                $col->{length} = { %{ $override_value } };
+                _record_override($col, 'length', $override_value);
+
+                push @fields_applied, 'length';
+                next;
+            }
+
+            _override_scalar_field(
+                col            => $col,
+                field          => $field,
+                override_value => $override_value,
+                issues         => $issues,
+            );
+
+            push @fields_applied, $field;
+        }
+
+        if (@fields_applied) {
+            my @sorted_fields = sort @fields_applied;
+
+            push @$issues, {
+                level        => 'info',
+                code         => 'override_applied',
+                message      => 'Overrides applied to column',
+                column_index => $col->{index},
+                details      => {
+                    fields => \@sorted_fields,
+                },
+            };
+
+            $col->{provenance}{overrides} = [ @sorted_fields ];
+        }
+    }
+
+    return;
+}
+
+sub _different_length {
+    my ($a, $b) = @_;
+
+    if (!defined $a && !defined $b) {
+        return 0;
+    }
+    if (!defined $a || !defined $b) {
+        return 1;
+    }
+    if (ref($a) ne 'HASH' || ref($b) ne 'HASH') {
+        return 1;
+    }
+
+    for my $k (qw(min max)) {
+        my $av = exists $a->{$k} ? $a->{$k} : undef;
+        my $bv = exists $b->{$k} ? $b->{$k} : undef;
+
+        if ((defined $av) != (defined $bv)) {
+            return 1;
+        }
+        if (defined $av && defined $bv && int($av) != int($bv)) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+sub _override_scalar_field {
+    my (%args) = @_;
+
+    my $col            = $args{col};
+    my $field          = $args{field};
+    my $override_value = $args{override_value};
+    my $issues         = $args{issues};
+
+    if ($field eq 'nullable') {
+        $override_value = $override_value ? 1 : 0;
+    }
+
+    my $inferred_value = exists $col->{$field} ? $col->{$field} : undef;
+
+    my $different = 0;
+    if (!defined $inferred_value && !defined $override_value) {
+        $different = 0;
+    } elsif (!defined $inferred_value || !defined $override_value) {
+        $different = 1;
+    } else {
+        $different = ($inferred_value ne $override_value) ? 1 : 0;
+    }
+
+    if ($different) {
+        push @$issues, {
+            level        => 'warning',
+            code         => 'override_conflicts_with_profile',
+            message      => 'Override conflicts with inferred value',
+            column_index => $col->{index},
+            details      => {
+                field            => $field,
+                overridden_value => defined $override_value ? $override_value : undef,
+                inferred_value   => defined $inferred_value ? $inferred_value : undef,
+            },
+        };
+    }
+
+    $col->{$field} = $override_value;
+    _record_override($col, $field, $override_value);
+
+    return;
+}
+
+sub _record_override {
+    my ($col, $field, $value) = @_;
+
+    $col->{overrides} = {} if !exists $col->{overrides} || ref($col->{overrides}) ne 'HASH';
+
+    if ($field eq 'length') {
+        $col->{overrides}{length} = { %{ $value } };
+        return;
+    }
+
+    $col->{overrides}{$field} = $value;
+
+    return;
+}
+
+# ------------------------
 # Type inference (v1)
 # ------------------------
 
@@ -237,7 +487,6 @@ sub _infer_type_from_column {
 
     my $evidence = $col->{type_evidence};
 
-    # No evidence → string
     if (!defined $evidence || ref($evidence) ne 'HASH' || !%$evidence) {
         return ('string', []);
     }
@@ -252,7 +501,6 @@ sub _infer_type_from_column {
         return ('string', []);
     }
 
-    # Temporal vs non-temporal conflict
     my @temporal = grep { $_ eq 'date' || $_ eq 'datetime' } @present;
     my @other    = grep { $_ ne 'date' && $_ ne 'datetime' } @present;
 
@@ -274,7 +522,6 @@ sub _infer_type_from_column {
         );
     }
 
-    # Temporal widening
     if (@temporal) {
         if (grep { $_ eq 'datetime' } @temporal) {
             if (@temporal > 1) {
@@ -298,7 +545,6 @@ sub _infer_type_from_column {
         return ('date', []);
     }
 
-    # Scalar widening chain
     my @order = qw(boolean integer number string);
     my %rank  = map { $order[$_] => $_ } 0 .. $#order;
 
@@ -363,7 +609,7 @@ sub _cmp_column_index {
         return 0;
     }
     if ($a_is_undef) {
-        return 1;    # undef last
+        return 1;
     }
     if ($b_is_undef) {
         return -1;
@@ -378,32 +624,38 @@ sub _stable_details_string {
     if (!defined $details) {
         return '';
     }
-    if (ref($details) ne 'HASH') {
-        return '';
-    }
 
-    my @keys = sort keys %$details;
-    my @pairs;
-    for my $k (@keys) {
-        my $v = $details->{$k};
-        if (!defined $v) {
-            push @pairs, $k . '=';
-        } elsif (ref($v) eq 'ARRAY') {
-            push @pairs, $k . '=[' . join(',', @$v) . ']';
-        } elsif (ref($v) eq 'HASH') {
-            my @ik = sort keys %$v;
-            my @ip;
-            for my $ik (@ik) {
-                my $iv = $v->{$ik};
-                push @ip, $ik . '=' . (defined $iv ? $iv : '');
+    if (ref($details) eq 'HASH') {
+        my @keys = sort keys %$details;
+        my @pairs;
+
+        for my $k (@keys) {
+            my $v = $details->{$k};
+            if (!defined $v) {
+                push @pairs, $k . '=';
+            } elsif (ref($v) eq 'ARRAY') {
+                push @pairs, $k . '=[' . join(',', @$v) . ']';
+            } elsif (ref($v) eq 'HASH') {
+                my @ik = sort keys %$v;
+                my @ip;
+                for my $ik (@ik) {
+                    my $iv = $v->{$ik};
+                    push @ip, $ik . '=' . (defined $iv ? $iv : '');
+                }
+                push @pairs, $k . '={' . join(',', @ip) . '}';
+            } else {
+                push @pairs, $k . '=' . $v;
             }
-            push @pairs, $k . '={' . join(',', @ip) . '}';
-        } else {
-            push @pairs, $k . '=' . $v;
         }
+
+        return join(';', @pairs);
     }
 
-    return join(';', @pairs);
+    if (ref($details) eq 'ARRAY') {
+        return '[' . join(',', @$details) . ']';
+    }
+
+    return '' . $details;
 }
 
 # ------------------------
@@ -479,7 +731,7 @@ sub _json_quote {
     $s =~ s/\r/\\r/g;
     $s =~ s/\t/\\t/g;
     $s =~ s/\f/\\f/g;
-    $s =~ s/\x08/\\b/g;    # backspace character
+    $s =~ s/\x08/\\b/g;
 
     $s =~ s/([\x00-\x1f])/sprintf("\\u%04x", ord($1))/ge;
 
@@ -606,6 +858,18 @@ sub _ordered_keys_for_path {
         return _ranked_sort_keys($hash, \%rank);
     }
 
+    if (@$path >= 3 && $path->[0] eq 'columns' && $path->[2] eq 'length') {
+        my @ordered = qw(min max);
+        @rank{@ordered} = (0 .. $#ordered);
+        return _ranked_sort_keys($hash, \%rank);
+    }
+
+    if (@$path >= 3 && $path->[0] eq 'columns' && $path->[2] eq 'overrides') {
+        my @ordered = qw(type nullable name length);
+        @rank{@ordered} = (0 .. $#ordered);
+        return _ranked_sort_keys($hash, \%rank);
+    }
+
     if (@$path >= 1 && $path->[0] eq 'generator') {
         my @ordered = qw(name version);
         @rank{@ordered} = (0 .. $#ordered);
@@ -672,6 +936,9 @@ Flat::Schema - Deterministic schema contracts for flat files
 
     my $schema = Flat::Schema->from_profile(
         profile => $profile_report,
+        overrides => [
+            { column_index => 0, set => { type => 'integer', nullable => 0 } },
+        ],
     );
 
     my $json = Flat::Schema->new()->to_json(schema => $schema);
@@ -690,9 +957,31 @@ JSON/YAML serialization and for downstream validation (see L<Flat::Validate>).
 
 This distribution is under active development.
 
-Current implementation milestones include deterministic serialization, v1 type
-inference (based on profile evidence), and v1 nullability inference based on
-Profile's null model and observed counts.
+Implemented so far:
+
+=over 4
+
+=item *
+
+Canonical schema structure (v1)
+
+=item *
+
+Deterministic JSON/YAML serialization
+
+=item *
+
+v1 type inference based on profile evidence
+
+=item *
+
+v1 nullability inference based on observed nulls
+
+=item *
+
+v1 user overrides (index-based) with audit trail and override issues
+
+=back
 
 =head1 METHODS
 
@@ -700,9 +989,15 @@ Profile's null model and observed counts.
 
     my $schema = Flat::Schema->from_profile(
         profile => $profile_report,
+        overrides => [
+            { column_index => 0, set => { type => 'string', nullable => 1 } },
+        ],
     );
 
 Consumes a Flat::Profile report and returns the canonical schema data structure.
+
+Overrides are optional and are applied after inference. Conflicts between
+inferred values and overrides are recorded as issues.
 
 =head2 to_json
 
