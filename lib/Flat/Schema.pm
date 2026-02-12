@@ -926,6 +926,8 @@ sub _ranked_sort_keys {
 
 =pod
 
+=encoding utf8
+
 =head1 NAME
 
 Flat::Schema - Deterministic schema contracts for flat files
