@@ -2,13 +2,10 @@ name = "Flat-Schema"
 authority = "cpan:SDS"
 license = "perl_5"
 
-# README.md is ALWAYS regenerated from POD SSOT.
-readme_from = "lib/Flat/Schema.pm"
+# Ensure Minilla generates README.md from the POD you control.
+readme_from   = "lib/Flat/Schema.pm"
+abstract_from = "lib/Flat/Schema.pm"
+authors_from  = "lib/Flat/Schema.pm"
 
+# Enforce your preferred tag style for Minilla-created release tags.
 tag_format = "v%v"
-
-[release]
-pause_config = 1
-
-[Metadata]
-x_static_install = 1
